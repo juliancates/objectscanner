@@ -436,6 +436,26 @@ function runDetect() {
         return;
       }
 
+      if (!result || result.inliers.length < 12) {
+        setS('st-detect',
+          `Only ${result?result.inliers.length:0} inliers (need ≥12 for reliable warp). ` +
+          `Ensure more of the dot border is visible in frame.`, 'err');
+        drawOverlays(matched.map(m=>({x:m.px,y:m.py,r:m.r})), canvas);
+        return;
+      }
+
+      // Sanity check: apply H forward to inlier preview points → should land in output space
+      const dstXs = result.inliers.map(i => applyH(result.H, matched[i].px, matched[i].py)[0]);
+      const dstYs = result.inliers.map(i => applyH(result.H, matched[i].px, matched[i].py)[1]);
+      const dstMinX = Math.min(...dstXs), dstMaxX = Math.max(...dstXs);
+      const dstMinY = Math.min(...dstYs), dstMaxY = Math.max(...dstYs);
+      const expectedW = MAT_W_IN * 96, expectedH_px = MAT_H_IN * 96;
+      if (dstMinX < -expectedW || dstMaxX > expectedW*2 ||
+          dstMinY < -expectedH_px || dstMaxY > expectedH_px*2) {
+        setS('st-detect', 'Homography produced invalid output — ensure more of the dot border is visible.', 'err');
+        return;
+      }
+
       detectedH = result.H;
       drawOverlays(result.inliers.map(i=>({x:matched[i].px,y:matched[i].py,r:matched[i].r})), canvas);
       setS('st-detect', `✓ ${matched.length} matched · ${result.inliers.length} inliers · ready to trace`, 'ok');
@@ -600,16 +620,33 @@ function runPipeline() {
       // Output: 4× US Letter at 96dpi = 384dpi
       const W=3264, H=4224;
 
-      // detectedH is a Float64Array[9] mapping preview-px → inches×96dpi.
-      // Scale to: src = full-res image coords, dst = 4× output coords.
+      // detectedH maps: preview-px → physical-inches × 96dpi (1× space)
+      // We need:        full-res-px → 4×96dpi output space (384dpi)
+      //
+      // Compose: H_final = S_dst × detectedH × S_src_inv
+      //   S_src_inv scales full-res px → preview px (divide by sx, sy)
+      //   S_dst scales 1×96 → 4×96 output (multiply by 4)
+      //
+      // For a homography H, composing with scale matrices:
+      //   Left-multiply by S_dst:  scales output (rows 0,1 of H×S_dst)
+      //   Right-multiply by S_src: scales input  (cols 0,1 of S_src×H)
+      //
+      // Correct formula: h_final[r][c] = H[r][c]
+      //   with input scaling:  col 0 *= 1/sx,  col 1 *= 1/sy
+      //   with output scaling: row 0 *= 4,      row 1 *= 4
+      // detectedH maps preview-px → physical-output-px (forward, src→dst).
+      // warpPerspective takes a forward homography and handles inverse sampling internally.
+      // Scale: input from preview-px → full-res-px (÷sx,÷sy), output to 4×96dpi (×4).
       const canvas=document.getElementById('preview-canvas');
       const sx=srcImg.width/canvas.width, sy=srcImg.height/canvas.height;
-      const h=detectedH; // Float64Array[9]
+      const h=detectedH; // forward map: preview-px → inches×96dpi
       const h4=new Float64Array(9);
       for(let r=0;r<3;r++) for(let c=0;c<3;c++){
         let v=h[r*3+c];
-        if(c===0) v/=sx; if(c===1) v/=sy; // preview→full-res source
-        if(r===0) v*=4;  if(r===1) v*=4;  // 1×96dpi→4×96dpi dest
+        if(c===0) v/=sx;
+        if(c===1) v/=sy;
+        if(r===0) v*=4;
+        if(r===1) v*=4;
         h4[r*3+c]=v;
       }
       const H4=cv.matFromArray(3,3,cv.CV_64F,Array.from(h4));
@@ -623,7 +660,10 @@ function runPipeline() {
         cv.INTER_LANCZOS4,cv.BORDER_CONSTANT,new cv.Scalar(255,255,255,255));
       H4.delete(); srcFull.delete();
 
-      // ── Erase ALL dot positions using Canvas 2D, then display ───────────────
+      // ── Erase ALL dot positions using Canvas 2D ──────────────────────────
+      // Dots are erased in the perspective-corrected space at their exact
+      // known physical positions × 384dpi. Use a large radius to handle
+      // any small homography error and perspective distortion of the dots.
       const eCanvas = document.createElement('canvas');
       eCanvas.width = W; eCanvas.height = H;
       cv.imshow(eCanvas, warped);
@@ -631,35 +671,43 @@ function runPipeline() {
       {
         const ctx2 = eCanvas.getContext('2d');
         ctx2.fillStyle = '#ffffff';
-        const dotR = (DOT_RADIUS_IN + 0.18) * 384; // dot radius + generous margin
+        // Erase radius: dot radius + 0.25in safety margin = 0.43in = 165px at 384dpi
+        const dotR = (DOT_RADIUS_IN + 0.25) * 384;
         MAT_DOTS.forEach(dot => {
           ctx2.beginPath();
           ctx2.arc(dot.x * 384, dot.y * 384, dotR, 0, Math.PI*2);
           ctx2.fill();
         });
       }
-      // Show the dot-erased version in the warp preview
       const warpedClean = cv.imread(eCanvas);
+      // Also paint the paper border region white using canvas2D.
+      // The area outside the dot ring (beyond DOT_MARGIN_IN from each edge)
+      // contains background (granite etc.) that leaked in from the warp.
+      // Paint a generous margin around all four edges white.
+      {
+        const ctx2 = eCanvas.getContext('2d');
+        ctx2.fillStyle = '#ffffff';
+        const margin = DOT_MARGIN_IN * 384; // inner edge of dot ring in px
+        // Top strip
+        ctx2.fillRect(0, 0, W, margin);
+        // Bottom strip
+        ctx2.fillRect(0, H - margin, W, margin);
+        // Left strip
+        ctx2.fillRect(0, 0, margin, H);
+        // Right strip
+        ctx2.fillRect(W - margin, 0, margin, H);
+      }
+      const warpedMasked = cv.imread(eCanvas);
       const wCanvas=document.getElementById('warp-canvas');
       wCanvas.width=W; wCanvas.height=H;
-      cv.imshow(wCanvas, warpedClean);
+      cv.imshow(wCanvas, warpedMasked);
 
-      // Declare outside block so SVG section can access them
       const parts=[];
-      let cropW, cropH;
+      const cropW = W, cropH = H;
 
       {
-        // ── Crop to inner scanning area ───────────────────────────────────
-        const CROP_IN = 0.78;
-        const cropX = Math.round(CROP_IN * 384);
-        const cropY = Math.round(CROP_IN * 384);
-        cropW = W - cropX * 2;
-        cropH = H - cropY * 2;
-        const roi = new cv.Rect(cropX, cropY, cropW, cropH);
-        const cropped = warpedClean.roi(roi);
-        const inner = new cv.Mat();
-        cropped.copyTo(inner);
-        cropped.delete(); warpedClean.delete();
+        warpedClean.delete(); // free the intermediate
+        const inner = warpedMasked;
 
         // ── Grayscale ─────────────────────────────────────────────────────
         const gray = new cv.Mat();
@@ -702,11 +750,14 @@ function runPipeline() {
         }
 
         // ── Morphological cleanup ─────────────────────────────────────────
-        // Open 2×2: remove noise specks
+        // Open 2×2: remove isolated noise specks
         const kO=cv.Mat.ones(2,2,cv.CV_8U), op=new cv.Mat();
         cv.morphologyEx(bin,op,cv.MORPH_OPEN,kO); kO.delete();
-        // Close 35×35 ellipse: fills lighter centres of thick marker strokes
-        const kC=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(35,35));
+
+        // Close with moderate kernel to fill ink texture gaps without
+        // distorting the shape of enclosed counters (inside of a, u, n etc.)
+        // 15×15 bridges ~4px gaps in marker strokes at 384dpi
+        const kC=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(15,15));
         const cl=new cv.Mat();
         cv.morphologyEx(op,cl,cv.MORPH_CLOSE,kC); op.delete(); kC.delete();
 
@@ -714,7 +765,7 @@ function runPipeline() {
         const ctrs=new cv.MatVector(), hier=new cv.Mat();
         cv.findContours(cl,ctrs,hier,cv.RETR_CCOMP,cv.CHAIN_APPROX_SIMPLE);
 
-        const mg=20;
+        const mg=8; // small margin to avoid warpPerspective edge fill artifacts
         const minOuterPx = Math.max(params.minarea*16, 2000);
         const minHolePx  = 1500; // real letter counters (j,u,a,n) are >1500px²
         const epsVal = Math.max(1.0, params.eps*4);
@@ -734,7 +785,8 @@ function runPipeline() {
           parts.push({pts, isHole, area});
         }
         hier.delete(); ctrs.delete();
-        [inner,gray,suppressed,eq,bl,bin,cl].forEach(m=>m.delete());
+        [gray,suppressed,eq,bl,bin,cl].forEach(m=>m.delete());
+        warpedMasked.delete();
       } // end dot-erase block
 
       // Sort: outer contours first (largest area first), then holes
@@ -768,8 +820,10 @@ function runPipeline() {
           const cy = h.pts.reduce((s,p)=>s+p.y,0)/h.pts.length;
           return ptInPoly(cx, cy, outer.pts);
         });
+        // Holes use less smoothing to preserve counter shape accuracy
+        const holeTension = Math.min(params.smooth, 0.15);
         const d = buildPath(outer.pts, params.smooth) +
-          (myHoles.length ? ' ' + myHoles.map(h => buildPath(h.pts, params.smooth)).join(' ') : '');
+          (myHoles.length ? ' ' + myHoles.map(h => buildPath(h.pts, holeTension)).join(' ') : '');
         return `<path d="${d}" fill="black" fill-rule="evenodd"/>`;
       }).join('\n');
 
