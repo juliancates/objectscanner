@@ -36,7 +36,7 @@ Place your object on the printed mat, photograph it, and the scanner corrects th
 
 ```
 object-scanner/
-├── scanner_v11.html   # The entire application — open this in a browser
+├── scanner.html   # The entire application — open this in a browser
 ├── scanme.png         # Sample photo to try
 ├── screenshot.png     # UI screenshot
 └── README.md
